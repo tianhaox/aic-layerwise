@@ -20,3 +20,11 @@ layerwise_tools/
 See `layerwise_tools/README.md` for canonical run commands, expected numbers on GLM-5-FP8 / Qwen3.5-122B-A10B-FP8 / Kimi-K2.6 / MiniMax-M2.7, and cross-framework caveats.
 
 The `.claude/skills/layerwise-new-model` skill onboards a new HuggingFace LLM to the vLLM path in 7 steps.
+
+## TODO
+
+1. **sglang single-GPU mock** — model-config hack to simulate rank-0 of TP=N on one GPU, mirroring the vLLM `num_heads / num_kv_heads / moe_intermediate_size` trick so attention and MoE compute match a real TP rank to within run-to-run noise.
+2. **MoE router hack for 3 backends** — force balanced routing (not dummy-gate collapse) under `--load-format=dummy` for vLLM, sglang, and TRT-LLM so live-NVTX MoE numbers are trustworthy without needing the AIC `distributed="balanced"` collector path.
+3. **Define the collector test cases** — a fixed matrix of (model family × bs × past_kv × precision × parallelism) that every framework must reproduce. Output goes into the perf DB.
+4. **Simplify and unify post-processing** — single parser serving all three frameworks; consolidate `parse_nsys_module.py` / `parse_nsys_step_sweep.py` / `parse_nsys_wall_vs_gpu.py` behind one CLI, standardize the 2-step `originalGraphNodeId` JOIN, add per-rank partition as first-class output.
+5. **Consider CPU overhead** — surface wall-vs-GPU gap (host dispatch + NCCL blocking wait) as a named line item in the breakdown, not just a reported residual. Matters for small-batch decode where CPU launch dominates.
