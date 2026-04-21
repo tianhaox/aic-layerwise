@@ -1,0 +1,16 @@
+[project]
+name = "layerwise-vllm-plugin"
+version = "0.1.0"
+description = "vLLM general_plugins entry point that installs layerwise NVTX + layer-skip + step-marker patches in every worker process (works under spawn)."
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+layerwise = "layerwise_vllm:install"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["layerwise_vllm*"]
