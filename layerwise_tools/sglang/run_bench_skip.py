@@ -6,7 +6,7 @@ Extras:
     overwrite of nested dicts; supports dotted keys).
 
 Steps:
-  1. Import `layer_skip_patch` + `skip_prefill_patch` — installs monkey-patches.
+  1. Import `sglang_model_patches` — installs model-behavior monkey-patches.
   2. Pre-parse `--config-overrides`; if present, download + patch model config,
      rewrite `--model-path` in argv to the local tmp dir.
   3. Import sglang.bench_one_batch, force mp fork, call main().
@@ -27,11 +27,12 @@ import sys
 
 # Make sibling dirs importable.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _THIS_DIR)  # layer_skip_patch, skip_prefill_patch
+sys.path.insert(0, _THIS_DIR)  # local SGLang profiling patches
 sys.path.insert(0, os.path.join(_THIS_DIR, "..", "common"))  # config_patch
 
-import layer_skip_patch   # noqa: F401  (identity-skip non-target DecoderLayer)
-import skip_prefill_patch  # noqa: F401  (short-circuit EXTEND mode)
+import sglang_model_patches  # noqa: F401  (model behavior patches)
+import moe_topk_hack_patch  # noqa: F401  (optional MoE power-law topk ids)
+import sglang_step_marker  # noqa: F401  (optional bench_step::* NVTX ranges)
 from config_patch import patch_model_path
 
 from sglang.bench_one_batch import BenchArgs, main
@@ -62,7 +63,14 @@ def _maybe_patch_model_path(argv):
     if overrides_json and model_path:
         overrides = json.loads(overrides_json)
         # Auto-select model_type rewrites + auto_map strip for known quirks.
-        rewrites = {"glm_moe_dsa": "deepseek_v3", "deepseek_v32": "deepseek_v3"}
+        rewrites = {
+            "glm_moe_dsa": "deepseek_v3",
+            "deepseek_v32": "deepseek_v3",
+            # Transformers does not know DeepSeek-V4 yet. Rewriting to
+            # deepseek_ref lets sglang's DeepSeek-V4 config loader take over
+            # while keeping architectures=["DeepseekV4ForCausalLM"] intact.
+            "deepseek_v4": "deepseek_ref",
+        }
         local = patch_model_path(model_path, overrides,
                                  strip_auto_map=True,
                                  model_type_rewrites=rewrites)

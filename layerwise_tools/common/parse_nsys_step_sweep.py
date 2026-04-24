@@ -42,10 +42,12 @@ from collections import defaultdict
 
 _BENCH_STEP_RE = re.compile(r"bench_step::N(\d+)::bs(\d+)::past(\d+)")
 _MODULE_RE = re.compile(r"'Module':\s*'([^']+)'")
+_GLOBAL_PID_MASK = -16777216  # nsys globalTid with low 24 bits cleared
 
 _DEFAULT_KERNEL_DROP = re.compile(
     r"(ncclDevKernel|ncclKernel|all2all|deep_ep|ep_fuse|nvshmem|"
-    r"multimem_all_reduce|one_shot_all_reduce|two_shot_all_reduce)",
+    r"multimem_all_reduce|one_shot_all_reduce|two_shot_all_reduce|"
+    r"^dispatch$|^combine$)",
     re.IGNORECASE,
 )
 
@@ -89,7 +91,9 @@ def _query_kernels(cur):
            R.globalTid, R.start AS runtime_start,
            R.start AS capture_start, R.end AS capture_end
     FROM CUPTI_ACTIVITY_KIND_KERNEL K
-    JOIN CUPTI_ACTIVITY_KIND_RUNTIME R ON K.correlationId = R.correlationId
+    JOIN CUPTI_ACTIVITY_KIND_RUNTIME R
+      ON K.correlationId = R.correlationId
+     AND K.globalPid = (R.globalTid & ?)
     WHERE K.graphNodeId IS NULL
     """
     if has_graph:
@@ -99,7 +103,9 @@ def _query_kernels(cur):
                R.globalTid, R.start AS runtime_start,
                CGE2.start AS capture_start, CGE2.end AS capture_end
         FROM CUPTI_ACTIVITY_KIND_KERNEL K
-        JOIN CUPTI_ACTIVITY_KIND_RUNTIME R ON K.correlationId = R.correlationId
+        JOIN CUPTI_ACTIVITY_KIND_RUNTIME R
+          ON K.correlationId = R.correlationId
+         AND K.globalPid = (R.globalTid & ?)
         LEFT JOIN CUDA_GRAPH_NODE_EVENTS CGE1
           ON K.graphNodeId = CGE1.graphNodeId
          AND R.globalTid = CGE1.globalTid
@@ -109,7 +115,8 @@ def _query_kernels(cur):
          AND CGE1.globalTid = CGE2.globalTid
         WHERE K.graphNodeId IS NOT NULL
         """
-    cur.execute(query)
+    params = (_GLOBAL_PID_MASK,) * (2 if has_graph else 1)
+    cur.execute(query, params)
     return cur.fetchall()
 
 
@@ -182,15 +189,13 @@ def _sum_kernels(cur, kernel_drop_re):
 
     # A single `cudaGraphLaunch` call fires every kernel in the graph with
     # the same host correlationId but distinct `graphNodeId` per kernel.
-    # So the dedup key must be (correlationId, graphNodeId) — both to
-    # avoid collapsing ~50 kernels in one graph into 1, and to dedup the
-    # many CGE1/CGE2 JOIN rows coming from multiple instantiates of the
-    # same template.
-    kern_meta = {}  # (cid, gnid) → (ks, ke, short_id, tid, rt_start)
-    kern_best_mod = {}  # (cid, gnid) → (best_mod_start, best_mod_name)
+    # In multi-process nsys traces, correlationId is only unique within a
+    # process, so include globalTid in the dedup key as well.
+    kern_meta = {}  # (tid, cid, gnid) → (ks, ke, short_id, tid, rt_start)
+    kern_best_mod = {}  # (tid, cid, gnid) → (best_mod_start, best_mod_name)
     for row in _query_kernels(cur):
         cid, gnid, ks, ke, short_id, tid, rt_start, cap_s, cap_e = row
-        key = (cid, gnid)
+        key = (tid, cid, gnid)
         if key not in kern_meta:
             kern_meta[key] = (ks, ke, short_id, tid, rt_start)
         if cap_s is None:
@@ -258,6 +263,9 @@ def main():
                     help="Include NCCL / all2all / deep_ep kernels in totals.")
     ap.add_argument("--per-rank", action="store_true",
                     help="Emit one row per (step, rank) instead of summing across ranks.")
+    ap.add_argument("--rank-reduce", choices=("sum", "max"), default="sum",
+                    help="How to reduce ranks when --per-rank is not set. "
+                         "'max' is useful for EP/MoE wall-critical compute.")
     args = ap.parse_args()
 
     kernel_drop_re = re.compile("^$") if args.keep_comm else _DEFAULT_KERNEL_DROP
@@ -279,14 +287,20 @@ def main():
     tid_to_rank = {tid: i for i, tid in enumerate(tids)}
     n_ranks = len(tids)
     if n_ranks > 1:
-        mode = "per-rank" if args.per_rank else f"SUMMED across {n_ranks} ranks (divide for per-rank)"
+        if args.per_rank:
+            mode = "per-rank"
+        elif args.rank_reduce == "max":
+            mode = f"MAX across {n_ranks} ranks"
+        else:
+            mode = f"SUMMED across {n_ranks} ranks (divide for per-rank)"
         print(f"[multi-rank] {n_ranks} ranks detected — output mode: {mode}",
               file=sys.stderr)
 
     rollup_re = re.compile(args.rollup)
-    # Aggregate by (step_meta, roll_key [, rank]).
-    rolled_ns = defaultdict(int)
-    rolled_k = defaultdict(int)
+    # First aggregate by rank; then optionally reduce ranks. This lets `max`
+    # pick the slowest rank per rolled-up module instead of summing all ranks.
+    per_rank_ns = defaultdict(int)
+    per_rank_k = defaultdict(int)
     step_seen = set()
     roll_keys = set()
     rank_seen = set()
@@ -297,17 +311,33 @@ def main():
         roll_key = m.groups() if m.groups() else (m.group(0),)
         if args.layer is not None and roll_key and str(args.layer) != str(roll_key[0]):
             continue
-        rank = tid_to_rank[tid] if args.per_rank else None
+        rank = tid_to_rank[tid]
         step_seen.add(step_meta)
         roll_keys.add(roll_key)
         rank_seen.add(rank)
         key = (step_meta, roll_key, rank)
-        rolled_ns[key] += ns
-        rolled_k[key] += n_k[(step_meta, mod, tid)]
+        per_rank_ns[key] += ns
+        per_rank_k[key] += n_k[(step_meta, mod, tid)]
 
     if not step_seen:
         print("No rows matched the rollup regex.", file=sys.stderr)
         sys.exit(1)
+
+    rolled_ns = defaultdict(int)
+    rolled_k = defaultdict(int)
+    if args.per_rank:
+        rolled_ns.update(per_rank_ns)
+        rolled_k.update(per_rank_k)
+    else:
+        rank_seen = {None}
+        for (step_meta, roll_key, rank), ns in per_rank_ns.items():
+            out_key = (step_meta, roll_key, None)
+            if args.rank_reduce == "sum":
+                rolled_ns[out_key] += ns
+                rolled_k[out_key] += per_rank_k[(step_meta, roll_key, rank)]
+            elif ns > rolled_ns[out_key]:
+                rolled_ns[out_key] = ns
+                rolled_k[out_key] = per_rank_k[(step_meta, roll_key, rank)]
 
     sorted_steps = sorted(step_seen, key=lambda s: s[0])
     sorted_keys = sorted(roll_keys)

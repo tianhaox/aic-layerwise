@@ -22,6 +22,7 @@ from collections import defaultdict
 
 _BENCH_STEP_RE = re.compile(r"bench_step::N(\d+)::bs(\d+)::past(\d+)")
 _NODE_MASK = 0xFFFFFFFF
+_GLOBAL_PID_MASK = -16777216  # nsys globalTid with low 24 bits cleared
 
 
 def _bench_step_ranges(cur):
@@ -61,7 +62,7 @@ def _sum_gpu_graph(cur, step_ranges):
         ranges = step_ranges_by_tid.get(tid, [])
         for s, e, n in ranges:
             if s <= rs < e:
-                corr_to_key[cid] = (tid, n)
+                corr_to_key[(tid & _GLOBAL_PID_MASK, cid)] = (tid, n)
                 break
             if s > rs:
                 break
@@ -69,10 +70,10 @@ def _sum_gpu_graph(cur, step_ranges):
     gpu_ns = defaultdict(int)
     n_k = defaultdict(int)
     cur.execute(
-        "SELECT correlationId, start, end FROM CUPTI_ACTIVITY_KIND_KERNEL"
+        "SELECT correlationId, globalPid, start, end FROM CUPTI_ACTIVITY_KIND_KERNEL"
     )
-    for cid, ks, ke in cur.fetchall():
-        key = corr_to_key.get(cid)
+    for cid, gpid, ks, ke in cur.fetchall():
+        key = corr_to_key.get((gpid, cid))
         if key is None:
             continue
         gpu_ns[key] += ke - ks

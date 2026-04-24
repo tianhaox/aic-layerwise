@@ -15,8 +15,9 @@ layerwise_tools/
 │   └── parse_nsys_module.py        # per-module rollup, auto-detects graph vs eager
 ├── sglang/
 │   ├── run_bench_skip.py           # driver wrapping sglang.bench_one_batch
-│   ├── layer_skip_patch.py         # identity-skip non-target DecoderLayer
-│   └── skip_prefill_patch.py       # fake ModelRunner.forward for EXTEND
+│   ├── sglang_model_patches.py     # layer skip / prefill skip / V4 debug patches
+│   ├── run_dsv4pro_tp8_mock.sh     # DeepSeek-V4-Pro single-GPU TP8 mock
+│   └── profile_dsv4pro_tp8_mock_nsys.sh
 ├── vllm/
 │   ├── run_vllm_bench.py           # driver wrapping vllm.benchmarks.latency
 │   ├── vllm_layer_skip_patch.py    # identity-skip + early PytHooks (compile=NONE)
@@ -32,7 +33,7 @@ layerwise_tools/
 | framework | how it achieves this |
 |---|---|
 | TRT-LLM (`examples/layer_wise_benchmarks`) | `config_ctx.yaml` sets `use_cuda_graph: false`, `config_gen.yaml` sets `use_cuda_graph: true`. Full graph via `torch.cuda.CUDAGraph()`. |
-| sglang (this toolkit, `run_bench_skip.py`) | prefill eager (or faked via `skip_prefill_patch`); decode uses `--cuda-graph-max-bs N` / piecewise cuda graph from sglang. |
+| sglang (this toolkit, `run_bench_skip.py`) | prefill eager (or faked via `sglang_model_patches.py`); decode uses `--cuda-graph-max-bs N` / piecewise cuda graph from sglang. |
 | vLLM (this toolkit, `run_vllm_bench.py`) | `--compilation-config '{"mode":0,"cudagraph_mode":"FULL"}'`. vLLM auto-downgrades FULL→`FULL_DECODE_ONLY` for DSA models, giving prefill-eager/decode-graph for free. |
 
 ## Canonical runs
@@ -86,6 +87,31 @@ nsys export --type sqlite --force-overwrite=true nsys_glm5_bs128.nsys-rep
 python3 ../common/parse_nsys_module.py nsys_glm5_bs128.sqlite \
     --rollup 'layers\.(\d+)\.(self_attn|mlp|input_layernorm|post_attention_layernorm)'
 ```
+
+### sglang (DeepSeek-V4-Pro, single-GPU TP8 mock)
+
+DeepSeek-V4-Pro is newer than the installed Transformers parser, so
+`run_bench_skip.py` rewrites `model_type=deepseek_v4` to `deepseek_ref` while
+keeping `architectures=["DeepseekV4ForCausalLM"]`.
+
+```bash
+cd layerwise_tools/sglang
+GPU=0 ./run_dsv4pro_tp8_mock.sh
+```
+
+For nsys + module rollup:
+
+```bash
+cd layerwise_tools/sglang
+GPU=0 OUT=nsys_dsv4pro_tp8mock ./profile_dsv4pro_tp8_mock_nsys.sh
+```
+
+The TP8-local mock sets `num_attention_heads=16`, `o_groups=2`, and
+`moe_intermediate_size=384` under `--tp-size 1`. Current FlashMLA sparse decode
+only dispatches `h_q == 64/128`, so the script enables
+`LAYERWISE_FLASHMLA_PAD_HQ=1`: it pads FlashMLA query heads to 64 and slices the
+output back to 16. This is useful for bring-up and MoE/linear profiling, but
+FlashMLA attention kernel time is inflated relative to true TP8-local attention.
 
 ### TensorRT-LLM
 
