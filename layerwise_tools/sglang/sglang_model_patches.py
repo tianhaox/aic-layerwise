@@ -16,6 +16,12 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _disable_torch_compile(fn):
+    """Keep profiling monkey patches as graph breaks under torch.compile."""
+    disable = getattr(getattr(torch, "compiler", None), "disable", None)
+    return disable(fn) if disable is not None else fn
+
+
 # ---------------------------------------------------------------------------
 # Layer skip
 # ---------------------------------------------------------------------------
@@ -204,6 +210,7 @@ def install_deepseekv4_cache_patch() -> None:
 
     orig = DeepSeekV4TokenToKVPool.set_swa_key_buffer_radix_fused
 
+    @_disable_torch_compile
     def patched(self, layer_id, raw_loc, cache_k):
         if getattr(self, "_should_cache_swa", False) and not hasattr(self, "cached_loc"):
             self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
@@ -255,6 +262,7 @@ def install_flashmla_pad_patch() -> None:
 
     orig = adapter.flash_mla_with_kvcache_entrypoint
 
+    @_disable_torch_compile
     def patched_flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         q = kwargs.get("q")
         if q is None or q.dim() != 4:

@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.join(_THIS_DIR, "..", "common"))  # config_patch
 
 import sglang_model_patches  # noqa: F401  (model behavior patches)
 import moe_topk_hack_patch  # noqa: F401  (optional MoE power-law topk ids)
+import moe_ep_local_experts_patch  # noqa: F401  (optional full-layer EP-local experts timing)
 import sglang_step_marker  # noqa: F401  (optional bench_step::* NVTX ranges)
 from config_patch import patch_model_path
 

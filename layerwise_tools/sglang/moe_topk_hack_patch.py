@@ -7,9 +7,9 @@ used by aiconfigurator/collector/sglang/collect_moe.py.
 
 from __future__ import annotations
 
-import math
 import os
-from typing import Optional
+import sys
+from pathlib import Path
 
 import torch
 
@@ -19,6 +19,13 @@ from sglang.srt.layers.moe import topk as _topk_module
 _ORIGINAL_OVERRIDE = _topk_module._maybe_override_topk_ids_random
 _CACHE: dict[tuple, torch.Tensor] = {}
 _LOGGED: set[tuple] = set()
+_AIC_HELPERS = None
+
+
+def _disable_torch_compile(fn):
+    """Keep env-driven top-k hacks outside Dynamo graphs."""
+    disable = getattr(getattr(torch, "compiler", None), "disable", None)
+    return disable(fn) if disable is not None else fn
 
 
 def _mode() -> str:
@@ -86,57 +93,37 @@ def _swap_max_to_rank0() -> bool:
     value = env_swap.strip().lower()
     if value not in ("", "auto"):
         return value in ("1", "true", "yes", "on")
-    return _distributed_world_size() <= 1
+    # AIC helper semantics always swap the max-load EP rank into rank0.
+    return True
 
 
-def _sample_power_law(
-    size: int,
-    alpha: float,
-    xmin: float,
-    xmax: float,
-    *,
-    generator: torch.Generator,
-) -> torch.Tensor:
-    u = torch.rand(size, generator=generator, device="cpu")
-    if abs(alpha - 1.0) < 1e-6:
-        return xmin * (xmax / xmin) ** u
-    return ((xmax ** (1 - alpha) - xmin ** (1 - alpha)) * u + xmin ** (1 - alpha)) ** (
-        1 / (1 - alpha)
+def _aic_collector_path() -> Path:
+    return Path(
+        os.getenv(
+            "LAYERWISE_AIC_COLLECTOR_PATH",
+            "/tianhao/debug/dsv4/aiconfigurator/collector",
+        )
     )
 
 
-def _round_robin_adjust_per_rank(
-    counts_2d: torch.Tensor,
-    remaining: int,
-    *,
-    add: bool,
-    upper_bound: int,
-) -> torch.Tensor:
-    while remaining > 0:
-        progressed = False
-        for rank_idx in range(counts_2d.size(0)):
-            local = counts_2d[rank_idx]
-            valid = torch.nonzero(local < upper_bound if add else local > 0).flatten()
-            if valid.numel() == 0:
-                continue
-            local_idx = valid[torch.argmin(local[valid]) if add else torch.argmax(local[valid])]
-            local[local_idx] += 1 if add else -1
-            remaining -= 1
-            progressed = True
-            if remaining == 0:
-                break
-        if not progressed:
-            break
-    return counts_2d
-
-
-def _assign_experts_from_counts(
-    counts: torch.Tensor, num_tokens: int, topk: int
-) -> torch.Tensor:
-    sorted_experts = torch.argsort(counts, descending=True)
-    sorted_counts = counts[sorted_experts]
-    expert_ids_flat = torch.repeat_interleave(sorted_experts, sorted_counts)
-    return expert_ids_flat.reshape(topk, num_tokens).t().contiguous()
+def _load_aic_helpers():
+    global _AIC_HELPERS
+    if _AIC_HELPERS is not None:
+        return _AIC_HELPERS
+    collector_path = _aic_collector_path()
+    path_str = str(collector_path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+    try:
+        from helper import _generate_power_law_distribution, balanced_logits
+    except Exception as exc:
+        raise RuntimeError(
+            "LAYERWISE_MOE_TOPK_HACK_MODE=power_law/balanced requires the AIC "
+            f"collector helper. Could not import helper from {collector_path}. "
+            "Set LAYERWISE_AIC_COLLECTOR_PATH to the aiconfigurator/collector path."
+        ) from exc
+    _AIC_HELPERS = (_generate_power_law_distribution, balanced_logits)
+    return _AIC_HELPERS
 
 
 def _power_law_selected_experts(
@@ -149,62 +136,27 @@ def _power_law_selected_experts(
     seed: int,
     swap_max_to_rank0: bool,
 ) -> torch.Tensor:
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
-
-    if num_tokens * topk > num_experts:
-        counts = _sample_power_law(
-            num_experts, alpha, 1, num_tokens * 0.8, generator=generator
+    if not swap_max_to_rank0:
+        raise ValueError(
+            "AIC power-law topk hack requires swapping the max-load EP rank to rank0. "
+            "Set LAYERWISE_MOE_TOPK_HACK_SWAP_MAX_TO_RANK0=1 or leave it as auto."
         )
-    else:
-        counts = _sample_power_law(num_experts, alpha, 0.01, 2, generator=generator)
-
-    target_sum = num_tokens * topk
-    counts = torch.round(counts / counts.sum() * target_sum).to(torch.int64)
-    upper_bound = num_tokens
-
-    overflow = int((counts - upper_bound).clamp(min=0).sum().item())
-    counts = counts.clamp(max=upper_bound)
-
-    experts_per_rank = num_experts // ep
-    if overflow > 0:
-        counts = _round_robin_adjust_per_rank(
-            counts.view(ep, experts_per_rank),
-            overflow,
-            add=True,
-            upper_bound=upper_bound,
-        ).view(-1)
-
-    delta = target_sum - int(counts.sum().item())
-    if delta != 0:
-        counts = _round_robin_adjust_per_rank(
-            counts.view(ep, experts_per_rank),
-            abs(delta),
-            add=delta > 0,
-            upper_bound=upper_bound,
-        ).view(-1)
-
-    rank_loads = counts.view(ep, experts_per_rank).sum(dim=1)
-    max_rank = int(torch.argmax(rank_loads).item())
-    if swap_max_to_rank0 and max_rank != 0:
-        counts_2d = counts.view(ep, experts_per_rank)
-        counts_2d[[0, max_rank]] = counts_2d[[max_rank, 0]]
-        counts = counts_2d.view(-1)
-
-    return _assign_experts_from_counts(counts, num_tokens, topk).to(torch.int32)
+    generate_power_law, _ = _load_aic_helpers()
+    rng_state = torch.random.get_rng_state()
+    try:
+        torch.manual_seed(seed)
+        _, selected = generate_power_law(num_tokens, num_experts, topk, ep, alpha)
+    finally:
+        torch.random.set_rng_state(rng_state)
+    return selected.to(torch.int32).cpu().contiguous()
 
 
 def _balanced_selected_experts(
     num_tokens: int, num_experts: int, topk: int
 ) -> torch.Tensor:
-    stride = math.ceil(num_experts / topk)
-    token_indices = torch.arange(num_tokens).unsqueeze(1)
-    topk_indices = torch.arange(topk).unsqueeze(0)
-    if num_tokens >= stride:
-        ids = (token_indices + topk_indices * stride) % num_experts
-    else:
-        ids = (token_indices * stride / num_tokens + topk_indices * stride) % num_experts
-    return ids.to(torch.int32)
+    _, balanced_logits = _load_aic_helpers()
+    router_logits = balanced_logits(num_tokens, num_experts, topk)
+    return torch.topk(router_logits, topk, dim=-1).indices.to(torch.int32).cpu().contiguous()
 
 
 def _cached_ids(
@@ -274,6 +226,7 @@ def _cached_ids(
     return cached.clone()
 
 
+@_disable_torch_compile
 def _maybe_override_topk_ids(topk_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
     mode = _mode()
     if mode in ("", "off", "none", "false", "0", "random"):
